@@ -6,9 +6,21 @@
 #include "cv_utils.hpp"
 #include "constants.hpp"
 #include <cxxopts.hpp>
+#include <thread>
+#include <mutex>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace torch::indexing;
+
+// Function to split data into chunks
+std::vector<std::vector<Camera>> splitData(const std::vector<Camera>& data, int numChunks) {
+    std::vector<std::vector<Camera>> chunks(numChunks);
+    for (size_t i = 0; i < data.size(); ++i) {
+        chunks[i % numChunks].push_back(data[i]);
+    }
+    return chunks;
+}
 
 int main(int argc, char *argv[]){
     cxxopts::Options options("opensplat", "Open Source 3D Gaussian Splats generator - " APP_VERSION);
@@ -118,28 +130,41 @@ int main(int argc, char *argv[]){
                     numIters, keepCrs,
                     device);
 
-        std::vector< size_t > camIndices( cams.size() );
-        std::iota( camIndices.begin(), camIndices.end(), 0 );
-        InfiniteRandomIterator<size_t> camsIter( camIndices );
+        const int numThreads = std::thread::hardware_concurrency();
+        auto camChunks = splitData(cams, numThreads);
 
-        int imageSize = -1;
         for (size_t step = 1; step <= numIters; step++){
-            Camera& cam = cams[ camsIter.next() ];
+            std::vector<std::thread> threads;
+            std::mutex optimizerMutex;
 
-            model.optimizersZeroGrad();
+            for (int t = 0; t < numThreads; ++t) {
+                threads.emplace_back([&, t]() {
+                    for (Camera& cam : camChunks[t]) {
+                        model.optimizersZeroGrad();
 
-            torch::Tensor rgb = model.forward(cam, step);
-            torch::Tensor gt = cam.getImage(model.getDownscaleFactor(step));
-            gt = gt.to(device);
+                        torch::Tensor rgb = model.forward(cam, step);
+                        torch::Tensor gt = cam.getImage(model.getDownscaleFactor(step));
+                        gt = gt.to(device);
 
-            torch::Tensor mainLoss = model.mainLoss(rgb, gt, ssimWeight);
-            mainLoss.backward();
-            
-            if (step % displayStep == 0) std::cout << "Step " << step << ": " << mainLoss.item<float>() << std::endl;
+                        torch::Tensor mainLoss = model.mainLoss(rgb, gt, ssimWeight);
+                        mainLoss.backward();
 
-            model.optimizersStep();
+                        {
+                            std::lock_guard<std::mutex> lock(optimizerMutex);
+                            model.optimizersStep();
+                        }
+                    }
+                });
+            }
+
+            for (auto& thread : threads) {
+                thread.join();
+            }
+
             model.schedulersStep(step);
             model.afterTrain(step);
+
+            if (step % displayStep == 0) std::cout << "Step " << step << ": " << mainLoss.item<float>() << std::endl;
 
             if (saveEvery > 0 && step % saveEvery == 0){
                 fs::path p(outputScene);
@@ -156,7 +181,6 @@ int main(int argc, char *argv[]){
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene);
-        // model.saveDebugPly("debug.ply");
 
         // Validate
         if (valCam != nullptr){
